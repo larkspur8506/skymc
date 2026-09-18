@@ -780,92 +780,181 @@ def ensure_server_running(sb, info):
     return False, f"已点击 {action}，但等待 Online 超时"
 
 
-def _js_force_click(sb, el_finder_js):
-    """对找到的元素派发真实鼠标事件（兼容 React 菜单）"""
-    script = el_finder_js + r"""
-        if (!el) return null;
-        var target = el.closest('button') || el.closest('a') || el.closest('[role="button"]')
-                  || el.closest('[role="menuitem"]') || el;
-        try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
-        var rect = target.getBoundingClientRect();
-        var x = rect.left + rect.width / 2;
-        var y = rect.top + rect.height / 2;
-        var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
-        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(type) {
-            try {
-                var Ev = type.indexOf('pointer') === 0 ? PointerEvent : MouseEvent;
-                target.dispatchEvent(new Ev(type, opts));
-            } catch (e) {
-                try { target.dispatchEvent(new MouseEvent(type, opts)); } catch (e2) {}
-            }
-        });
-        try { target.click(); } catch (e) {}
-        return (target.innerText || target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
-    """
+def _is_visible_box(rect):
+    return rect and rect.get("w", 0) > 5 and rect.get("h", 0) > 5
+
+
+def locate_expires_button(sb):
+    """只返回真正可见、有尺寸的 Expires 按钮信息"""
     try:
-        return sb.execute_script(script)
+        info = sb.execute_script(
+            r"""
+            var best = null;
+            var nodes = document.querySelectorAll('button, a, [role="button"]');
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/expires\s+in\s+\d+/i.test(t)) continue;
+                var r = n.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) continue;
+                var st = window.getComputedStyle(n);
+                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                // 侧边栏底部按钮通常在左下角
+                var score = r.bottom + (r.left < 400 ? 1000 : 0);
+                var item = {
+                    text: t,
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    w: r.width,
+                    h: r.height,
+                    left: r.left,
+                    top: r.top,
+                    ariaExpanded: n.getAttribute('aria-expanded'),
+                    dataState: n.getAttribute('data-state'),
+                    className: (n.className || '').toString().slice(0, 120),
+                    tag: n.tagName,
+                    score: score
+                };
+                if (!best || item.score > best.score) best = item;
+            }
+            return best ? JSON.stringify(best) : null;
+            """
+        )
+        if not info:
+            return None
+        return json.loads(info)
     except Exception as e:
-        print(f"   force_click 异常: {e}")
+        print(f"   locate_expires 失败: {e}")
         return None
 
 
-def find_expires_button_js():
-    return r"""
-        var el = null;
-        var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
-        for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-            if (!t || t.length > 40) continue;
-            if (/expires\s+in\s+\d+/i.test(t)) {
-                if (n.offsetParent === null && getComputedStyle(n).display === 'none') continue;
-                el = n.closest('button') || n.closest('a') || n.closest('[role="button"]') || n;
+def locate_renew_option(sb):
+    try:
+        info = sb.execute_script(
+            r"""
+            var best = null;
+            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li, div, span');
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!(/^renew$/i.test(t) || t === '续期')) continue;
+                if (/expires/i.test(t)) continue;
+                var r = n.getBoundingClientRect();
+                if (r.width < 3 || r.height < 3) continue;
+                var st = window.getComputedStyle(n);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                best = {
+                    text: t,
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    w: r.width,
+                    h: r.height,
+                    role: n.getAttribute('role'),
+                    tag: n.tagName
+                };
                 break;
             }
-        }
-    """
-
-
-def find_renew_in_menu_js():
-    return r"""
-        var el = null;
-        var nodes = document.querySelectorAll(
-            'button, a, [role="menuitem"], [role="option"], [role="menu"] *, li, div, span'
-        );
-        for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-            if (!t || t.length > 24) continue;
-            // 只要单独的 Renew / 续期，不要带 Expires 的按钮
-            if (/^renew$/i.test(t) || t === '续期') {
-                if (n.offsetParent === null && getComputedStyle(n).visibility === 'hidden') continue;
-                el = n.closest('button') || n.closest('a') || n.closest('[role="menuitem"]') || n;
-                break;
-            }
-        }
-    """
+            return best ? JSON.stringify(best) : null;
+            """
+        )
+        if not info:
+            return None
+        return json.loads(info)
+    except Exception:
+        return None
 
 
 def renew_visible_in_dom(sb):
-    """检测页面上是否已出现菜单里的 Renew（不含 Expires 文案）"""
+    return locate_renew_option(sb) is not None
+
+
+def _cdp_click_xy(sb, x, y):
+    """用 CDP 在视口坐标点击（比 JS click 更接近真实用户）"""
     try:
-        return bool(
-            sb.execute_script(
-                r"""
-                var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li, div, span');
-                for (var i = 0; i < nodes.length; i++) {
-                    var t = (nodes[i].innerText || nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
-                    if (/^renew$/i.test(t) || t === '续期') {
-                        var st = window.getComputedStyle(nodes[i]);
-                        if (st.display === 'none' || st.visibility === 'hidden') continue;
-                        return true;
-                    }
-                }
-                return false;
-                """
-            )
+        driver = sb.driver
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0},
         )
-    except Exception:
+        time.sleep(0.05)
+        for etype in ("mousePressed", "mouseReleased"):
+            driver.execute_cdp_cmd(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": etype,
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 1 if etype == "mousePressed" else 0,
+                    "clickCount": 1,
+                },
+            )
+            time.sleep(0.05)
+        return True
+    except Exception as e:
+        print(f"   CDP 点击失败: {e}")
+        return False
+
+
+def _action_chains_click_expires(sb):
+    """Selenium ActionChains：移动到可见 Expires 按钮再点击"""
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.common.by import By
+
+        candidates = sb.driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'Expires in')] | //*[@role='button' and contains(., 'Expires in')]",
+        )
+        target = None
+        for el in candidates:
+            try:
+                if not el.is_displayed():
+                    continue
+                size = el.size
+                if size.get("width", 0) < 5 or size.get("height", 0) < 5:
+                    continue
+                target = el
+                # 偏好更靠下的（侧边栏底部）
+            except Exception:
+                continue
+        if not target:
+            return False
+
+        sb.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", target
+        )
+        time.sleep(0.3)
+        actions = ActionChains(sb.driver)
+        actions.move_to_element(target).pause(0.4).click(target).perform()
+        print("   ActionChains 已 hover+click Expires")
+        time.sleep(1.0)
+        if renew_visible_in_dom(sb):
+            return True
+
+        # 键盘：Space / Enter 打开菜单
+        try:
+            target.send_keys(Keys.SPACE)
+            time.sleep(0.8)
+            if renew_visible_in_dom(sb):
+                print("   通过 Space 打开菜单")
+                return True
+            target.send_keys(Keys.ENTER)
+            time.sleep(0.8)
+            if renew_visible_in_dom(sb):
+                print("   通过 Enter 打开菜单")
+                return True
+            target.send_keys(Keys.ARROW_DOWN)
+            time.sleep(0.8)
+            if renew_visible_in_dom(sb):
+                print("   通过 ArrowDown 打开菜单")
+                return True
+        except Exception as e:
+            print(f"   键盘打开菜单失败: {e}")
+        return renew_visible_in_dom(sb)
+    except Exception as e:
+        print(f"   ActionChains 失败: {e}")
         return False
 
 
@@ -873,12 +962,42 @@ def open_expires_menu(sb):
     """点击侧边栏「Expires in XXm」，并确认菜单已打开（出现 Renew）"""
     print("🔍 查找并点击侧边栏 Expires 入口...")
 
-    # SeleniumBase 选择器优先
+    info = locate_expires_button(sb)
+    if info:
+        print(
+            f"   定位到 Expires: text={info.get('text')} pos=({info.get('x'):.0f},{info.get('y'):.0f}) "
+            f"size={info.get('w'):.0f}x{info.get('h'):.0f} "
+            f"aria-expanded={info.get('ariaExpanded')} data-state={info.get('dataState')}"
+        )
+    else:
+        print("   ⚠️ 未定位到可见的 Expires 按钮")
+
+    # 方法 1：ActionChains hover + click + 键盘
+    if _action_chains_click_expires(sb):
+        print("✅ Expires 菜单已打开（ActionChains）")
+        return True
+
+    # 方法 2：CDP 坐标点击
+    info = locate_expires_button(sb)
+    if info and _is_visible_box(info):
+        x, y = float(info["x"]), float(info["y"])
+        print(f"   尝试 CDP 坐标点击 ({x:.0f}, {y:.0f})")
+        _cdp_click_xy(sb, x, y)
+        time.sleep(1.2)
+        if renew_visible_in_dom(sb):
+            print("✅ Expires 菜单已打开（CDP）")
+            return True
+        # 再点一次稍偏上一点（有的热区在图标处）
+        _cdp_click_xy(sb, x, y - 5)
+        time.sleep(1.0)
+        if renew_visible_in_dom(sb):
+            print("✅ Expires 菜单已打开（CDP 偏移）")
+            return True
+
+    # 方法 3：SeleniumBase uc_click / click
     for sel in [
         'button:contains("Expires in")',
-        'button:contains("Expires")',
         '//button[contains(., "Expires in")]',
-        '//*[contains(normalize-space(.), "Expires in")]',
     ]:
         try:
             if sb.is_element_visible(sel):
@@ -886,41 +1005,82 @@ def open_expires_menu(sb):
                     sb.uc_click(sel)
                 except Exception:
                     sb.click(sel)
-                print(f"   已点击 Expires（{sel}）")
+                print(f"   已 uc/click Expires（{sel}）")
                 time.sleep(1.2)
                 if renew_visible_in_dom(sb):
-                    print("✅ Expires 菜单已打开（检测到 Renew）")
+                    print("✅ Expires 菜单已打开（uc_click）")
                     return True
         except Exception:
             continue
 
-    # JS 强制点击
-    hit = _js_force_click(sb, find_expires_button_js())
-    if hit:
-        print(f"   已 JS 强制点击: {hit}")
-        time.sleep(1.2)
-        if renew_visible_in_dom(sb):
-            print("✅ Expires 菜单已打开（检测到 Renew）")
-            return True
+    # 方法 4：JS 在「可见」按钮上派发完整指针事件
+    try:
+        hit = sb.execute_script(
+            r"""
+            var nodes = document.querySelectorAll('button, a, [role="button"]');
+            var target = null;
+            var bestBottom = -1;
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                var t = (n.innerText || '').replace(/\s+/g, ' ').trim();
+                if (!/expires\s+in\s+\d+/i.test(t)) continue;
+                var r = n.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) continue;
+                if (r.bottom > bestBottom) { bestBottom = r.bottom; target = n; }
+            }
+            if (!target) return null;
+            target.scrollIntoView({block:'center'});
+            target.focus();
+            var r = target.getBoundingClientRect();
+            var x = r.left + r.width/2, y = r.top + r.height/2;
+            var opts = {bubbles:true, cancelable:true, view:window, clientX:x, clientY:y, button:0, pointers:1};
+            ['pointerover','pointerenter','mouseover','mouseenter','pointerdown','mousedown',
+             'pointerup','mouseup','click'].forEach(function(type) {
+                try {
+                    var Ev = type.indexOf('pointer') === 0 ? PointerEvent : MouseEvent;
+                    target.dispatchEvent(new Ev(type, opts));
+                } catch (e) {
+                    try { target.dispatchEvent(new MouseEvent(type, opts)); } catch (e2) {}
+                }
+            });
+            try { target.click(); } catch (e) {}
+            return (target.innerText || '').replace(/\s+/g,' ').trim();
+            """
+        )
+        if hit:
+            print(f"   已 JS 完整事件点击: {hit}")
+            time.sleep(1.5)
+            if renew_visible_in_dom(sb):
+                print("✅ Expires 菜单已打开（JS events）")
+                return True
+    except Exception as e:
+        print(f"   JS events 点击失败: {e}")
 
-    # 再等一会儿，有的菜单动画较慢
-    for i in range(8):
+    # 最后再轮询一会儿
+    for _ in range(10):
         if renew_visible_in_dom(sb):
-            print("✅ Expires 菜单已打开（延迟检测到 Renew）")
+            print("✅ Expires 菜单已打开（延迟检测到）")
             return True
-        time.sleep(0.5)
+        time.sleep(0.4)
 
-    print("   ⚠️ 点击后仍未看到 Renew 菜单项")
+    print("   ⚠️ 多次点击后仍未看到 Renew 菜单项")
     return False
 
 
 def click_renew_option(sb):
     """在已打开的菜单中点击 Renew"""
+    info = locate_renew_option(sb)
+    if info and _is_visible_box(info):
+        print(f"   定位到 Renew: {info.get('text')} @ ({info.get('x'):.0f},{info.get('y'):.0f})")
+        if _cdp_click_xy(sb, float(info["x"]), float(info["y"])):
+            time.sleep(0.8)
+            print("✅ 已 CDP 点击 Renew")
+            return True
+
     for sel in [
         'button:contains("Renew")',
         'a:contains("Renew")',
         '//button[normalize-space()="Renew"]',
-        '//a[normalize-space()="Renew"]',
         '//*[@role="menuitem" and contains(., "Renew")]',
         '//*[normalize-space()="Renew"]',
         'button:contains("续期")',
@@ -936,10 +1096,27 @@ def click_renew_option(sb):
         except Exception:
             continue
 
-    hit = _js_force_click(sb, find_renew_in_menu_js())
-    if hit:
-        print(f"✅ 已 JS 强制点击 Renew: {hit}")
-        return True
+    # ActionChains 点 Renew
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        from selenium.webdriver.common.by import By
+
+        els = sb.driver.find_elements(
+            By.XPATH,
+            "//*[normalize-space()='Renew' or normalize-space()='续期']",
+        )
+        for el in els:
+            try:
+                if not el.is_displayed():
+                    continue
+                ActionChains(sb.driver).move_to_element(el).pause(0.2).click(el).perform()
+                print("✅ 已 ActionChains 点击 Renew")
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"   ActionChains 点 Renew 失败: {e}")
+
     return False
 
 
@@ -948,23 +1125,30 @@ def dump_menu_debug(sb):
         info = sb.execute_script(
             r"""
             var out = [];
-            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="menu"], [role="listbox"] *');
-            for (var i = 0; i < nodes.length && out.length < 40; i++) {
+            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="menu"], [role="listbox"], li, div, span');
+            for (var i = 0; i < nodes.length && out.length < 50; i++) {
                 var t = (nodes[i].innerText || '').replace(/\s+/g, ' ').trim();
-                if (!t || t.length > 50) continue;
-                if (/renew|upgrade|expire|续期|升级/i.test(t)) {
-                    out.push({
-                        tag: nodes[i].tagName,
-                        role: nodes[i].getAttribute('role'),
-                        text: t,
-                        visible: nodes[i].offsetParent !== null
-                    });
-                }
+                if (!t || t.length > 60) continue;
+                if (!/renew|upgrade|expire|续期|升级/i.test(t)) continue;
+                var r = nodes[i].getBoundingClientRect();
+                out.push({
+                    tag: nodes[i].tagName,
+                    role: nodes[i].getAttribute('role'),
+                    text: t.slice(0, 40),
+                    visible: nodes[i].offsetParent !== null,
+                    ariaExpanded: nodes[i].getAttribute('aria-expanded'),
+                    dataState: nodes[i].getAttribute('data-state'),
+                    w: Math.round(r.width),
+                    h: Math.round(r.height)
+                });
             }
             return JSON.stringify(out);
             """
         )
         print("   菜单相关 DOM:", info)
+        exp = locate_expires_button(sb)
+        if exp:
+            print("   Expires 按钮详情:", json.dumps(exp, ensure_ascii=False))
     except Exception as e:
         print("   dump_menu_debug 失败:", e)
 
@@ -1051,7 +1235,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v12.3")
+    print("🚀 启动 SkyMC 自动续期脚本 v12.4")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
