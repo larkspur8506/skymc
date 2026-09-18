@@ -780,139 +780,270 @@ def ensure_server_running(sb, info):
     return False, f"已点击 {action}，但等待 Online 超时"
 
 
+def _js_force_click(sb, el_finder_js):
+    """对找到的元素派发真实鼠标事件（兼容 React 菜单）"""
+    script = el_finder_js + r"""
+        if (!el) return null;
+        var target = el.closest('button') || el.closest('a') || el.closest('[role="button"]')
+                  || el.closest('[role="menuitem"]') || el;
+        try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+        var rect = target.getBoundingClientRect();
+        var x = rect.left + rect.width / 2;
+        var y = rect.top + rect.height / 2;
+        var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(type) {
+            try {
+                var Ev = type.indexOf('pointer') === 0 ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new Ev(type, opts));
+            } catch (e) {
+                try { target.dispatchEvent(new MouseEvent(type, opts)); } catch (e2) {}
+            }
+        });
+        try { target.click(); } catch (e) {}
+        return (target.innerText || target.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    """
+    try:
+        return sb.execute_script(script)
+    except Exception as e:
+        print(f"   force_click 异常: {e}")
+        return None
+
+
+def find_expires_button_js():
+    return r"""
+        var el = null;
+        var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 40) continue;
+            if (/expires\s+in\s+\d+/i.test(t)) {
+                if (n.offsetParent === null && getComputedStyle(n).display === 'none') continue;
+                el = n.closest('button') || n.closest('a') || n.closest('[role="button"]') || n;
+                break;
+            }
+        }
+    """
+
+
+def find_renew_in_menu_js():
+    return r"""
+        var el = null;
+        var nodes = document.querySelectorAll(
+            'button, a, [role="menuitem"], [role="option"], [role="menu"] *, li, div, span'
+        );
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 24) continue;
+            // 只要单独的 Renew / 续期，不要带 Expires 的按钮
+            if (/^renew$/i.test(t) || t === '续期') {
+                if (n.offsetParent === null && getComputedStyle(n).visibility === 'hidden') continue;
+                el = n.closest('button') || n.closest('a') || n.closest('[role="menuitem"]') || n;
+                break;
+            }
+        }
+    """
+
+
+def renew_visible_in_dom(sb):
+    """检测页面上是否已出现菜单里的 Renew（不含 Expires 文案）"""
+    try:
+        return bool(
+            sb.execute_script(
+                r"""
+                var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li, div, span');
+                for (var i = 0; i < nodes.length; i++) {
+                    var t = (nodes[i].innerText || nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
+                    if (/^renew$/i.test(t) || t === '续期') {
+                        var st = window.getComputedStyle(nodes[i]);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+                        return true;
+                    }
+                }
+                return false;
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def open_expires_menu(sb):
-    """点击侧边栏「Expires in XXm」打开菜单（菜单里才有 Renew）"""
-    print("🔍 查找侧边栏 Expires 入口...")
-    selectors = [
+    """点击侧边栏「Expires in XXm」，并确认菜单已打开（出现 Renew）"""
+    print("🔍 查找并点击侧边栏 Expires 入口...")
+
+    # SeleniumBase 选择器优先
+    for sel in [
         'button:contains("Expires in")',
         'button:contains("Expires")',
-        '//button[contains(., "Expires")]',
-        '//*[contains(text(),"Expires in")]',
-    ]
-    for sel in selectors:
+        '//button[contains(., "Expires in")]',
+        '//*[contains(normalize-space(.), "Expires in")]',
+    ]:
         try:
             if sb.is_element_visible(sel):
-                sb.uc_click(sel)
-                print(f"✅ 已点击 Expires 入口（{sel}）")
-                time.sleep(1.5)
-                return True
+                try:
+                    sb.uc_click(sel)
+                except Exception:
+                    sb.click(sel)
+                print(f"   已点击 Expires（{sel}）")
+                time.sleep(1.2)
+                if renew_visible_in_dom(sb):
+                    print("✅ Expires 菜单已打开（检测到 Renew）")
+                    return True
         except Exception:
             continue
 
-    # JS 兜底：找含 Expires in 的可点击元素
-    try:
-        result = sb.execute_script(
-            """
-            var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
-            for (var i = 0; i < nodes.length; i++) {
-                var el = nodes[i];
-                var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                if (!t || t.length > 40) continue;
-                if (/expires\\s+in\\s+\\d+/i.test(t) || /^expires\\s+in/i.test(t)) {
-                    if (el.offsetParent === null) continue;
-                    var clickable = el.closest('button') || el.closest('a') || el.closest('[role="button"]') || el;
-                    clickable.click();
-                    return t;
-                }
-            }
-            return null;
-            """
-        )
-        if result:
-            print(f"✅ 已通过 JS 点击 Expires 入口: {result}")
-            time.sleep(1.5)
+    # JS 强制点击
+    hit = _js_force_click(sb, find_expires_button_js())
+    if hit:
+        print(f"   已 JS 强制点击: {hit}")
+        time.sleep(1.2)
+        if renew_visible_in_dom(sb):
+            print("✅ Expires 菜单已打开（检测到 Renew）")
             return True
-    except Exception as e:
-        print(f"   JS 打开 Expires 菜单失败: {e}")
+
+    # 再等一会儿，有的菜单动画较慢
+    for i in range(8):
+        if renew_visible_in_dom(sb):
+            print("✅ Expires 菜单已打开（延迟检测到 Renew）")
+            return True
+        time.sleep(0.5)
+
+    print("   ⚠️ 点击后仍未看到 Renew 菜单项")
     return False
 
 
-def click_renew(sb):
-    """
-    新 UI：侧边栏底部「Expires in XXm」→ 弹出菜单 → 点 Renew
-    兼容旧 UI：页面上直接有 Renew 按钮
-    """
-    print("🔍 开始续期：先打开 Expires 菜单，再点 Renew...")
-
-    # 1) 先尝试直接点页面上的 Renew（旧 UI）
-    for sel in ['button:contains("Renew")', 'button:contains("续期")']:
-        try:
-            if sb.is_element_visible(sel):
-                sb.uc_click(sel)
-                print(f"✅ 直接点击 Renew 成功（{sel}）")
-                time.sleep(3)
-                if challenge_visible(sb):
-                    handle_cloudflare(sb, max_retry=3)
-                    time.sleep(2)
-                wait_challenge_gone(sb, timeout=15)
-                return True
-        except Exception:
-            continue
-
-    # 2) 新 UI：点 Expires in XXm
-    opened = open_expires_menu(sb)
-    if not opened:
-        print("❌ 未找到 Expires in 入口，也未找到直接 Renew 按钮")
-        safe_screenshot(sb, "renew_not_found.png")
-        return False
-
-    # 3) 菜单里点 Renew
-    time.sleep(1)
-    renew_clicked = False
+def click_renew_option(sb):
+    """在已打开的菜单中点击 Renew"""
     for sel in [
         'button:contains("Renew")',
         'a:contains("Renew")',
-        '//*[contains(text(),"Renew")]',
+        '//button[normalize-space()="Renew"]',
+        '//a[normalize-space()="Renew"]',
+        '//*[@role="menuitem" and contains(., "Renew")]',
+        '//*[normalize-space()="Renew"]',
         'button:contains("续期")',
     ]:
         try:
             if sb.is_element_visible(sel):
-                sb.uc_click(sel)
-                print(f"✅ 菜单中已点击 Renew（{sel}）")
-                renew_clicked = True
-                break
+                try:
+                    sb.uc_click(sel)
+                except Exception:
+                    sb.click(sel)
+                print(f"✅ 已点击 Renew（{sel}）")
+                return True
         except Exception:
             continue
 
-    if not renew_clicked:
-        try:
-            result = sb.execute_script(
-                """
-                var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], div, span, li');
-                for (var i = 0; i < nodes.length; i++) {
-                    var el = nodes[i];
-                    var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (!t || t.length > 30) continue;
-                    if (/^renew$/i.test(t) || t.toLowerCase() === 'renew' || t.indexOf('续期') >= 0) {
-                        if (el.offsetParent === null) continue;
-                        // 避开还在菜单外的 Expires 按钮本身
-                        if (/expires/i.test(t)) continue;
-                        var clickable = el.closest('button') || el.closest('a') || el.closest('[role="menuitem"]') || el;
-                        clickable.click();
-                        return t;
-                    }
+    hit = _js_force_click(sb, find_renew_in_menu_js())
+    if hit:
+        print(f"✅ 已 JS 强制点击 Renew: {hit}")
+        return True
+    return False
+
+
+def dump_menu_debug(sb):
+    try:
+        info = sb.execute_script(
+            r"""
+            var out = [];
+            var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="menu"], [role="listbox"] *');
+            for (var i = 0; i < nodes.length && out.length < 40; i++) {
+                var t = (nodes[i].innerText || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length > 50) continue;
+                if (/renew|upgrade|expire|续期|升级/i.test(t)) {
+                    out.push({
+                        tag: nodes[i].tagName,
+                        role: nodes[i].getAttribute('role'),
+                        text: t,
+                        visible: nodes[i].offsetParent !== null
+                    });
                 }
-                return null;
-                """
-            )
-            if result:
-                print(f"✅ 通过 JS 在菜单中点击: {result}")
-                renew_clicked = True
-        except Exception as e:
-            print(f"   JS 点击菜单 Renew 失败: {e}")
+            }
+            return JSON.stringify(out);
+            """
+        )
+        print("   菜单相关 DOM:", info)
+    except Exception as e:
+        print("   dump_menu_debug 失败:", e)
 
-    if not renew_clicked:
-        print("❌ 已打开 Expires 菜单，但未找到 Renew 选项")
-        safe_screenshot(sb, "renew_not_found.png")
-        return False
 
-    time.sleep(3)
-    if challenge_visible(sb):
-        print("   点击 Renew 后出现验证，正在处理...")
-        handle_cloudflare(sb, max_retry=3)
-        time.sleep(3)
-    wait_challenge_gone(sb, timeout=15)
-    return True
+def click_renew(sb):
+    """
+    流程：
+      1. 点侧边栏 Expires in XXm
+      2. 等待菜单出现 Renew
+      3. 点击 Renew
+      4. 若弹出 Cloudflare，按原逻辑处理
+    """
+    print("🔍 开始续期：Expires → 等待 Renew → 点击 Renew...")
+
+    # 旧 UI：页面上直接有 Renew
+    for sel in ['button:contains("Renew")', 'button:contains("续期")']:
+        try:
+            if sb.is_element_visible(sel):
+                # 排除侧边栏还没打开菜单时误点（旧面板大按钮）
+                sb.uc_click(sel)
+                print(f"✅ 直接点击 Renew 成功（{sel}）")
+                time.sleep(3)
+                if challenge_visible(sb):
+                    print("   出现验证，处理中...")
+                    handle_cloudflare(sb, max_retry=4)
+                    time.sleep(2)
+                wait_challenge_gone(sb, timeout=20)
+                return True
+        except Exception:
+            continue
+
+    # 新 UI：最多重试 3 次打开菜单并点 Renew
+    for attempt in range(1, 4):
+        print(f"   第 {attempt} 次尝试打开 Expires 菜单...")
+        opened = open_expires_menu(sb)
+
+        # 即使 open 返回 False，也再轮询等 Renew 出现
+        if not renew_visible_in_dom(sb):
+            print("   等待菜单中出现 Renew（最多 10 秒）...")
+            for _ in range(20):
+                if renew_visible_in_dom(sb):
+                    opened = True
+                    break
+                time.sleep(0.5)
+
+        if not renew_visible_in_dom(sb):
+            print(f"   第 {attempt} 次未出现 Renew，准备重试...")
+            dump_menu_debug(sb)
+            # 点一下页面空白，关掉可能的半开状态，再试
+            try:
+                sb.execute_script("document.body.click();")
+            except Exception:
+                pass
+            time.sleep(1)
+            continue
+
+        print("✅ 已检测到 Renew，准备点击...")
+        if click_renew_option(sb):
+            time.sleep(3)
+            if challenge_visible(sb):
+                print("   点击 Renew 后出现验证，正在处理...")
+                handle_cloudflare(sb, max_retry=4)
+                time.sleep(3)
+                # 验证过后若菜单还在，再点一次 Renew
+                if renew_visible_in_dom(sb):
+                    print("   验证后菜单仍在，再次点击 Renew...")
+                    click_renew_option(sb)
+                    time.sleep(2)
+            wait_challenge_gone(sb, timeout=20)
+            return True
+
+        print("   检测到 Renew 但点击失败，重试...")
+        dump_menu_debug(sb)
+        time.sleep(1)
+
+    print("❌ 多次尝试后仍无法点击 Renew")
+    dump_menu_debug(sb)
+    safe_screenshot(sb, "renew_not_found.png")
+    return False
 
 
 def main():
@@ -920,7 +1051,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v12.2")
+    print("🚀 启动 SkyMC 自动续期脚本 v12.3")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
