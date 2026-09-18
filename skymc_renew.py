@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SkyMC 自动续期脚本
-"""
+SkyMC 自动续期脚本 v12
 
+v11 已能登录、续期、关机启动、读取 MM:SS 倒计时。
+v12 新增 NODE_LINK（vless:// 或 vmess://）启动 sing-box 本地代理。
+"""
 
 import os
 import sys
@@ -508,7 +510,7 @@ def open_server_panel(sb):
 
 
 def read_panel_info(sb):
-    """读取状态、剩余时间、可用按钮"""
+    """读取状态、剩余时间、可用按钮（含侧边栏 Expires in XXm）"""
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         var status = 'unknown';
@@ -518,29 +520,45 @@ def read_panel_info(sb):
         else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
 
         var remaining = null;
-        var matches = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
-        for (var i = 0; i < matches.length; i++) {
-            remaining = matches[i];
-            break;
+        // 新 UI：Expires in 59m / Expires in 1h 20m
+        var exp = body.match(/Expires\s+in\s+(\d+)\s*h(?:\s*(\d+)\s*m)?/i);
+        if (exp) {
+            var h = parseInt(exp[1], 10) || 0;
+            var m = parseInt(exp[2] || '0', 10) || 0;
+            remaining = (h * 60 + m) + 'm';
+        } else {
+            exp = body.match(/Expires\s+in\s+(\d+)\s*m/i);
+            if (exp) {
+                remaining = exp[1] + 'm';
+            }
+        }
+        // 兼容旧 UI：MM:SS
+        if (!remaining) {
+            var matches = body.match(/\b(\d{1,3}:\d{2})\b/g) || [];
+            if (matches.length) remaining = matches[0];
         }
 
-        var hasStart = false, hasStop = false, hasRestart = false, hasRenew = false;
+        var hasStart = false, hasStop = false, hasRestart = false, hasRenew = false, hasExpires = false;
         var buttons = [];
-        var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {
-            var b = btns[i];
+        var all = document.querySelectorAll('button, a, [role="button"], div, span');
+        for (var i = 0; i < all.length; i++) {
+            var b = all[i];
             var text = (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!text || text.length > 80) continue;
             var aria = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '');
             var html = (b.innerHTML || '').toLowerCase();
             var blob = (text + ' ' + aria).toLowerCase();
             var visible = b.offsetParent !== null;
-            var enabled = !b.disabled && visible;
-            buttons.push({text: text, disabled: !!b.disabled, visible: visible});
-            if (!enabled) continue;
+            if (!visible) continue;
+            if (b.tagName === 'BUTTON' || b.getAttribute('role') === 'button') {
+                buttons.push({text: text, disabled: !!b.disabled, visible: visible});
+            }
+            if (b.disabled) continue;
             if (blob.indexOf('start') >= 0 || blob.indexOf('启动') >= 0 || html.indexOf('fa-play') >= 0) hasStart = true;
             if (blob.indexOf('stop') >= 0 || blob.indexOf('停止') >= 0 || blob.indexOf('关机') >= 0) hasStop = true;
             if (blob.indexOf('restart') >= 0 || blob.indexOf('重启') >= 0) hasRestart = true;
             if (blob.indexOf('renew') >= 0 || blob.indexOf('续期') >= 0) hasRenew = true;
+            if (blob.indexOf('expires in') >= 0 || blob.indexOf('expire') >= 0) hasExpires = true;
         }
         return JSON.stringify({
             status: status,
@@ -549,6 +567,7 @@ def read_panel_info(sb):
             hasStop: hasStop,
             hasRestart: hasRestart,
             hasRenew: hasRenew,
+            hasExpires: hasExpires,
             buttons: buttons
         });
     """
@@ -561,32 +580,41 @@ def read_panel_info(sb):
     status = info.get("status") or "unknown"
     remaining = info.get("remaining")
     print(f"   面板状态: {status}  剩余时间: {remaining or '未读到'}  "
-          f"Start={info.get('hasStart')} Stop={info.get('hasStop')} Renew={info.get('hasRenew')}")
+          f"Start={info.get('hasStart')} Stop={info.get('hasStop')} "
+          f"Expires={info.get('hasExpires')} Renew={info.get('hasRenew')}")
     return info
 
 
-def format_remaining(mmss):
-    if not mmss:
+def format_remaining(val):
+    if not val:
         return "未读到"
-    parts = str(mmss).split(":")
+    s = str(val).strip()
+    # 新格式：59m / 120m
+    if s.endswith("m") and s[:-1].isdigit():
+        mins = int(s[:-1])
+        return f"{mins}分钟（Expires in {mins}m）"
+    parts = s.split(":")
     try:
         if len(parts) == 2:
-            m, s = int(parts[0]), int(parts[1])
-            return f"{mmss}（{m}分钟{s}秒）"
+            m, sec = int(parts[0]), int(parts[1])
+            return f"{s}（{m}分钟{sec}秒）"
         if len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-            return f"{mmss}（{h}小时{m}分{s}秒）"
+            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+            return f"{s}（{h}小时{m}分{sec}秒）"
     except Exception:
         pass
-    return str(mmss)
+    return s
 
 
-def remaining_to_seconds(mmss):
-    """面板倒计时为 MM:SS（如 102:18 = 102分钟18秒）"""
-    if not mmss:
+def remaining_to_seconds(val):
+    """支持 59m 或 MM:SS"""
+    if not val:
         return None
-    parts = str(mmss).split(":")
+    s = str(val).strip().lower()
     try:
+        if s.endswith("m") and s[:-1].isdigit():
+            return int(s[:-1]) * 60
+        parts = s.split(":")
         if len(parts) == 2:
             return int(parts[0]) * 60 + int(parts[1])
         if len(parts) == 3:
@@ -752,24 +780,129 @@ def ensure_server_running(sb, info):
     return False, f"已点击 {action}，但等待 Online 超时"
 
 
-def click_renew(sb):
-    print("🔍 查找 Renew 按钮...")
-    clicked = False
-    for sel in ['button:contains("Renew")', 'button:contains("续期")']:
+def open_expires_menu(sb):
+    """点击侧边栏「Expires in XXm」打开菜单（菜单里才有 Renew）"""
+    print("🔍 查找侧边栏 Expires 入口...")
+    selectors = [
+        'button:contains("Expires in")',
+        'button:contains("Expires")',
+        '//button[contains(., "Expires")]',
+        '//*[contains(text(),"Expires in")]',
+    ]
+    for sel in selectors:
         try:
-            sb.wait_for_element_visible(sel, timeout=6)
-            sb.uc_click(sel)
-            print(f"✅ 已点击 Renew（{sel}）")
-            clicked = True
-            break
+            if sb.is_element_visible(sel):
+                sb.uc_click(sel)
+                print(f"✅ 已点击 Expires 入口（{sel}）")
+                time.sleep(1.5)
+                return True
         except Exception:
             continue
-    if not clicked:
-        clicked = click_named_button(sb, ["Renew", "续期"])
-        if clicked:
-            print("✅ 已点击 Renew")
-    if not clicked:
-        print("❌ 未找到 Renew 按钮")
+
+    # JS 兜底：找含 Expires in 的可点击元素
+    try:
+        result = sb.execute_script(
+            """
+            var nodes = document.querySelectorAll('button, a, [role="button"], div, span');
+            for (var i = 0; i < nodes.length; i++) {
+                var el = nodes[i];
+                var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length > 40) continue;
+                if (/expires\\s+in\\s+\\d+/i.test(t) || /^expires\\s+in/i.test(t)) {
+                    if (el.offsetParent === null) continue;
+                    var clickable = el.closest('button') || el.closest('a') || el.closest('[role="button"]') || el;
+                    clickable.click();
+                    return t;
+                }
+            }
+            return null;
+            """
+        )
+        if result:
+            print(f"✅ 已通过 JS 点击 Expires 入口: {result}")
+            time.sleep(1.5)
+            return True
+    except Exception as e:
+        print(f"   JS 打开 Expires 菜单失败: {e}")
+    return False
+
+
+def click_renew(sb):
+    """
+    新 UI：侧边栏底部「Expires in XXm」→ 弹出菜单 → 点 Renew
+    兼容旧 UI：页面上直接有 Renew 按钮
+    """
+    print("🔍 开始续期：先打开 Expires 菜单，再点 Renew...")
+
+    # 1) 先尝试直接点页面上的 Renew（旧 UI）
+    for sel in ['button:contains("Renew")', 'button:contains("续期")']:
+        try:
+            if sb.is_element_visible(sel):
+                sb.uc_click(sel)
+                print(f"✅ 直接点击 Renew 成功（{sel}）")
+                time.sleep(3)
+                if challenge_visible(sb):
+                    handle_cloudflare(sb, max_retry=3)
+                    time.sleep(2)
+                wait_challenge_gone(sb, timeout=15)
+                return True
+        except Exception:
+            continue
+
+    # 2) 新 UI：点 Expires in XXm
+    opened = open_expires_menu(sb)
+    if not opened:
+        print("❌ 未找到 Expires in 入口，也未找到直接 Renew 按钮")
+        safe_screenshot(sb, "renew_not_found.png")
+        return False
+
+    # 3) 菜单里点 Renew
+    time.sleep(1)
+    renew_clicked = False
+    for sel in [
+        'button:contains("Renew")',
+        'a:contains("Renew")',
+        '//*[contains(text(),"Renew")]',
+        'button:contains("续期")',
+    ]:
+        try:
+            if sb.is_element_visible(sel):
+                sb.uc_click(sel)
+                print(f"✅ 菜单中已点击 Renew（{sel}）")
+                renew_clicked = True
+                break
+        except Exception:
+            continue
+
+    if not renew_clicked:
+        try:
+            result = sb.execute_script(
+                """
+                var nodes = document.querySelectorAll('button, a, [role="menuitem"], [role="option"], div, span, li');
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    var t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (!t || t.length > 30) continue;
+                    if (/^renew$/i.test(t) || t.toLowerCase() === 'renew' || t.indexOf('续期') >= 0) {
+                        if (el.offsetParent === null) continue;
+                        // 避开还在菜单外的 Expires 按钮本身
+                        if (/expires/i.test(t)) continue;
+                        var clickable = el.closest('button') || el.closest('a') || el.closest('[role="menuitem"]') || el;
+                        clickable.click();
+                        return t;
+                    }
+                }
+                return null;
+                """
+            )
+            if result:
+                print(f"✅ 通过 JS 在菜单中点击: {result}")
+                renew_clicked = True
+        except Exception as e:
+            print(f"   JS 点击菜单 Renew 失败: {e}")
+
+    if not renew_clicked:
+        print("❌ 已打开 Expires 菜单，但未找到 Renew 选项")
         safe_screenshot(sb, "renew_not_found.png")
         return False
 
@@ -778,8 +911,6 @@ def click_renew(sb):
         print("   点击 Renew 后出现验证，正在处理...")
         handle_cloudflare(sb, max_retry=3)
         time.sleep(3)
-        click_named_button(sb, ["Renew", "续期"])
-        print("   已再次尝试点击 Renew")
     wait_challenge_gone(sb, timeout=15)
     return True
 
@@ -789,7 +920,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v12.1")
+    print("🚀 启动 SkyMC 自动续期脚本 v12.2")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
@@ -833,19 +964,20 @@ def main():
             print("🏁 脚本执行完毕")
             return
 
-        # Online 后再确认一次 Renew 是否出现；没有则多等一会儿
-        if not after_start.get("hasRenew"):
-            print("⏳ Online 但尚未看到 Renew，再等待最多 60 秒...")
+        # Online 后确认侧边栏 Expires 入口（新 UI 的续期入口）
+        if not after_start.get("hasExpires") and not after_start.get("hasRenew"):
+            print("⏳ Online 但尚未看到 Expires/Renew 入口，再等待最多 60 秒...")
             end_wait = time.time() + 60
             while time.time() < end_wait:
                 time.sleep(5)
                 after_start = read_panel_info(sb)
-                if after_start.get("hasRenew") or (after_start.get("status") or "").lower() != "online":
+                if after_start.get("hasExpires") or after_start.get("hasRenew"):
                     break
-            if not after_start.get("hasRenew"):
-                print("   仍未检测到 Renew 标记，仍将尝试点击")
+            if not after_start.get("hasExpires") and not after_start.get("hasRenew"):
+                print("   仍未检测到 Expires/Renew，仍将尝试点击")
 
         print("\n📄 开始续期流程（服务器已 Online）...")
+        print("   入口：侧边栏 Expires in XXm → 菜单 Renew")
         renew_ok = click_renew(sb)
 
         print("⏳ 等待续期结果刷新...")

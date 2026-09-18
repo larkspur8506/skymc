@@ -1,10 +1,18 @@
-# SkyMC 免费服务器自动续期工具
+# SkyMC 免费服务器自动续期工具 v12.2
 
-针对 SkyMC 免费计划服务器的 GitHub Actions 自动续期方案。
+## v12.2 更新
+- 续期入口：侧边栏 **Expires in XXm** → 菜单 → **Renew**
+- 倒计时支持 `Expires in 59m` 格式
+- 定时：每小时的 0 分、45 分（约每 45 分钟）
+- 兼容旧 UI 直接点 Renew
 
-- 面板：https://skymc.org/en/server/***
+---
+
+针对 SkyMC 免费计划服务器 **zdsa**（ID：`TuUzR_dWxO2P`）的 GitHub Actions 自动续期方案。
+
+- 面板：https://skymc.org/en/server/TuUzR_dWxO2P
 - 登录：https://skymc.org/en/login
-- 游戏地址：`***.skymc.io`
+- 游戏地址：`zdsa.skymc.io`
 
 免费计划需要定期点面板上的蓝色 **Renew** 按钮，倒计时归零后服务器会停止。本工具用 GitHub Actions 定时登录、过 Cloudflare、点 Renew；关机则点 Start；并把结果（含倒计时和截图）发到 Telegram。
 
@@ -22,18 +30,21 @@
 | 干净截图 | 等验证弹窗消失后再截图，上传 Actions Artifact |
 | Telegram 通知 | 文字 + 截图 |
 | 节点代理 | `NODE_LINK`（`vless://` / `vmess://`）启动 sing-box 突破区域限制 |
+| 备用提醒 | 不登录，只定时发 Telegram 提醒手动点 Renew |
 
 ---
 
 ## 目录结构
 
 ```
-skymc-renew/
+skymc-renew-v12/
 ├── README.md
 ├── requirements.txt
 ├── skymc_renew.py                 # 主脚本（登录 / 验证 / 续期 / 启动 / 代理）
+├── skymc_remind.py                # 纯提醒脚本（不登录）
 └── .github/workflows/
-    └── skymc-renew.yml            # 每 1 小时自动续期
+    ├── skymc-renew.yml            # 每 8 小时自动续期
+    └── skymc-remind.yml           # 每 6 小时提醒
 ```
 
 依赖：
@@ -73,7 +84,7 @@ Telegram 示例：
 ```
 【SkyMC 续期】
 ✅ 续期已执行
-服务器: ****
+服务器: TuUzR_dWxO2P
 当前状态: Online
 启动操作: 已在运行
 续期前时间: 102:18（102分钟18秒）
@@ -107,7 +118,7 @@ IP: x.x.x.x
 | `SKYMC_PASSWORD` | 是 | 登录密码 |
 | `TG_BOT_TOKEN` | 强烈建议 | Telegram 机器人 Token |
 | `TG_CHAT_ID` | 强烈建议 | Telegram Chat ID |
-| `NODE_LINK` | 可不填 | `vless://...` 或 `vmess://...`，用于代理 |
+| `NODE_LINK` | 建议 | `vless://...` 或 `vmess://...`，用于代理 |
 
 兼容别名（一般不用配）：`EMAIL`、`PASSWORD` 可代替 `SKYMC_EMAIL` / `SKYMC_PASSWORD`。
 
@@ -136,7 +147,7 @@ IP: x.x.x.x
 
 ---
 
-## 配置 NODE_LINK（sing-box 代理）（可不填，走直连）
+## 配置 NODE_LINK（sing-box 代理）
 
 用于 GitHub Actions IP 被 Cloudflare / 区域限制拦截时。
 
@@ -269,6 +280,16 @@ GitHub 出口 IP 容易被 Cloudflare 拦。配置 `NODE_LINK` 换出口。UC �
 
 ---
 
-## 免责声明
-本项目仅供个人使用，用于续期你自己的账号资源。请遵守 MWS 平台的服务条款，不要用于批量注册或薅羊毛。
+## 提醒脚本文案（skymc_remind.py）
+
+```
+SkyMC 免费服务器续期提醒
+
+服务器：zdsa
+ID：TuUzR_dWxO2P
+地址：zdsa.skymc.io
+
+面板：https://skymc.org/en/server/TuUzR_dWxO2P
+
+请尽快登录并点击蓝色 Renew 按钮！
 ```
