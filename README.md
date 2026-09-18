@@ -107,7 +107,7 @@ IP: x.x.x.x
 | `SKYMC_PASSWORD` | 是 | 登录密码 |
 | `TG_BOT_TOKEN` | 强烈建议 | Telegram 机器人 Token |
 | `TG_CHAT_ID` | 强烈建议 | Telegram Chat ID |
-| `NODE_LINK` | 建议 | `vless://...` 或 `vmess://...`，用于代理 |
+| `NODE_LINK` | 可不填 | `vless://...` 或 `vmess://...`，用于代理 |
 
 兼容别名（一般不用配）：`EMAIL`、`PASSWORD` 可代替 `SKYMC_EMAIL` / `SKYMC_PASSWORD`。
 
@@ -136,7 +136,7 @@ IP: x.x.x.x
 
 ---
 
-## 配置 NODE_LINK（sing-box 代理）
+## 配置 NODE_LINK（sing-box 代理）（可不填，走直连）
 
 用于 GitHub Actions IP 被 Cloudflare / 区域限制拦截时。
 
