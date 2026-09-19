@@ -513,8 +513,18 @@ def read_panel_info(sb):
     """读取状态、剩余时间、可用按钮（含侧边栏 Expires in XXm）"""
     script = r"""
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
+        // 新版 SkyMC:服务器到期后面板变为激活流程,先识别页面类型,再判断普通按钮
+        var page = null;
+        if (/Activate\s+Your\s+Server/i.test(body)) {
+            page = 'activate_plan';
+        } else if (/Game\s*&\s*Name/i.test(body) || /Order\s+Summary/i.test(body) ||
+                   (/Start\s+Server/i.test(body) && /Add-?\s*ons/i.test(body))) {
+            page = 'activate_config';
+        }
         var status = 'unknown';
-        if (/\bOnline\b/i.test(body) || /在线/.test(body)) status = 'Online';
+        if (page) {
+            status = 'needs_activation';
+        } else if (/\bOnline\b/i.test(body) || /在线/.test(body)) status = 'Online';
         else if (/\bStarting\b/i.test(body) || /启动中/.test(body)) status = 'Starting';
         else if (/\bStopping\b/i.test(body) || /关闭中/.test(body)) status = 'Stopping';
         else if (/\bOffline\b/i.test(body) || /\bStopped\b/i.test(body) || /离线/.test(body) || /已停止/.test(body)) status = 'Offline';
@@ -560,8 +570,11 @@ def read_panel_info(sb):
             if (blob.indexOf('renew') >= 0 || blob.indexOf('续期') >= 0) hasRenew = true;
             if (blob.indexOf('expires in') >= 0 || blob.indexOf('expire') >= 0) hasExpires = true;
         }
+        // 激活页里的 Start Server 是激活按钮,不是服务器面板的普通 Start,避免误判
+        if (page) hasStart = false;
         return JSON.stringify({
             status: status,
+            page: page,
             remaining: remaining,
             hasStart: hasStart,
             hasStop: hasStop,
@@ -578,8 +591,9 @@ def read_panel_info(sb):
         print(f"   读取面板信息失败: {e}")
         info = {}
     status = info.get("status") or "unknown"
+    page = info.get("page")
     remaining = info.get("remaining")
-    print(f"   面板状态: {status}  剩余时间: {remaining or '未读到'}  "
+    print(f"   面板状态: {status}  页面类型: {page or '-'}  剩余时间: {remaining or '未读到'}  "
           f"Start={info.get('hasStart')} Stop={info.get('hasStop')} "
           f"Expires={info.get('hasExpires')} Renew={info.get('hasRenew')}")
     return info
@@ -663,6 +677,291 @@ def click_named_button(sb, names):
     return False
 
 
+def dump_clickables(sb, limit=40):
+    """调试:列出当前页面可交互元素(激活流程首轮排错用)"""
+    script = r"""
+        var out = [];
+        var nodes = document.querySelectorAll('button, a, [role="button"], [role="option"], [role="radio"], [role="combobox"], input, label');
+        for (var i = 0; i < nodes.length && out.length < 60; i++) {
+            var n = nodes[i];
+            var r = n.getBoundingClientRect();
+            if (r.width < 3 || r.height < 3) continue;
+            var st = window.getComputedStyle(n);
+            if (st.display === 'none' || st.visibility === 'hidden') continue;
+            out.push({
+                tag: n.tagName,
+                type: n.type || '',
+                role: n.getAttribute('role') || '',
+                text: ((n.innerText || n.textContent || '') + '').replace(/\s+/g, ' ').trim().slice(0, 50),
+                aria: n.getAttribute('aria-label') || '',
+                title: n.getAttribute('title') || '',
+                cls: (n.className || '').toString().slice(0, 60),
+                dataState: n.getAttribute('data-state') || '',
+                checked: !!n.checked,
+                w: Math.round(r.width),
+                h: Math.round(r.height)
+            });
+        }
+        return JSON.stringify(out);
+    """
+    try:
+        raw = sb.execute_script(script)
+        items = json.loads(raw) if raw else []
+        print(f"   可交互元素 dump(共 {len(items)} 个):")
+        for it in items[:limit]:
+            extra = []
+            if it.get("type"):
+                extra.append(f"type={it['type']}")
+            if it.get("role"):
+                extra.append(f"role={it['role']}")
+            if it.get("dataState"):
+                extra.append(f"data-state={it['dataState']}")
+            if it.get("checked"):
+                extra.append("checked")
+            print(f"     <{it.get('tag')} {' '.join(extra)}> text='{it.get('text')}' "
+                  f"aria='{it.get('aria')}' cls='{it.get('cls')}' {it.get('w')}x{it.get('h')}")
+        return items
+    except Exception as e:
+        print(f"   dump_clickables 失败: {e}")
+        return []
+
+
+def dump_key_text(sb):
+    """调试:提取 body 中与激活流程相关的关键文字"""
+    script = r"""
+        var body = (document.body && document.body.innerText) ? document.body.innerText : '';
+        var lines = body.split('\n');
+        var out = [];
+        for (var i = 0; i < lines.length; i++) {
+            var t = lines[i].replace(/\s+/g, ' ').trim();
+            if (!t) continue;
+            if (/coal|free|location|germany|france|java|bedrock|server name|start server|order|add-?ons|game/i.test(t)) {
+                out.push(t.slice(0, 80));
+            }
+        }
+        return out.join(' | ').slice(0, 1000);
+    """
+    try:
+        return sb.execute_script(script) or ""
+    except Exception as e:
+        print(f"   dump_key_text 失败: {e}")
+        return ""
+
+
+def read_server_name_value(sb):
+    """只读配置页 Server Name 输入框当前值,绝不修改"""
+    script = r"""
+        var inputs = document.querySelectorAll('input');
+        for (var i = 0; i < inputs.length; i++) {
+            var inp = inputs[i];
+            if (inp.type === 'hidden' || inp.type === 'checkbox' || inp.type === 'radio') continue;
+            var r = inp.getBoundingClientRect();
+            if (r.width < 50 || r.height < 10) continue;
+            if (inp.offsetParent === null) continue;
+            return JSON.stringify({
+                value: inp.value || '',
+                placeholder: inp.placeholder || '',
+                id: inp.id || '',
+                name: inp.name || ''
+            });
+        }
+        return null;
+    """
+    try:
+        raw = sb.execute_script(script)
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        print(f"   读取 Server Name 失败: {e}")
+        return None
+
+
+def js_click_visible_text(sb, pattern, anti_pattern=None):
+    """
+    在可见元素中按正则匹配文本并点击(激活页的选项是卡片,不是传统 button)。
+    优先级:可交互(interactive/cursor:pointer)> 面积小(叶子节点)。
+    返回被点击元素信息(dict)或 None。
+    """
+    script = r"""
+        var pattern = arguments[0];
+        var anti = arguments[1] || null;
+        var re = new RegExp(pattern, 'i');
+        var reAnti = anti ? new RegExp(anti, 'i') : null;
+        var nodes = document.querySelectorAll(
+            'button, a, [role="button"], [role="option"], [role="radio"], [role="menuitem"], label, li, div, span'
+        );
+        var best = null;
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var t = ((n.innerText || n.textContent || '') + '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 120) continue;
+            if (!re.test(t)) continue;
+            if (reAnti && reAnti.test(t)) continue;
+            var r = n.getBoundingClientRect();
+            if (r.width < 5 || r.height < 5) continue;
+            var st = window.getComputedStyle(n);
+            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+            // 排除 Order Summary 里的同名展示文本(不可点击)
+            var p = n.parentElement, inSummary = false;
+            while (p && p !== document.body) {
+                var meta = '';
+                try {
+                    meta = ((p.getAttribute('class') || '') + ' ' + (p.getAttribute('id') || '')) || '';
+                } catch (e) { meta = ''; }
+                if (/summary/i.test(meta)) { inSummary = true; break; }
+                p = p.parentElement;
+            }
+            if (inSummary) continue;
+            var interactive = !!n.closest('button, a, [role="button"], [role="option"], [role="radio"], label');
+            var pointer = st.cursor === 'pointer';
+            var area = r.width * r.height;
+            var score = area + t.length * 10 - (interactive ? 10000000 : 0) - (pointer ? 5000000 : 0);
+            if (!best || score < best.score) {
+                best = {node: n, score: score, text: t, tag: n.tagName,
+                        x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)};
+            }
+        }
+        if (!best) return null;
+        var target = best.node.closest('button, a, [role="button"], [role="option"], [role="radio"], label') || best.node;
+        var r2 = target.getBoundingClientRect();
+        var x = r2.left + r2.width / 2, y = r2.top + r2.height / 2;
+        var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
+        ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown',
+         'pointerup', 'mouseup', 'click'].forEach(function(type) {
+            try {
+                var Ev = type.indexOf('pointer') === 0 ? PointerEvent : MouseEvent;
+                target.dispatchEvent(new Ev(type, opts));
+            } catch (e) {
+                try { target.dispatchEvent(new MouseEvent(type, opts)); } catch (e2) {}
+            }
+        });
+        try { target.click(); } catch (e) {}
+        return JSON.stringify({tag: target.tagName, text: best.text,
+                               x: Math.round(x), y: Math.round(y)});
+    """
+    try:
+        raw = sb.execute_script(script, pattern, anti_pattern)
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        print(f"   JS 文本点击失败({pattern}): {e}")
+        return None
+
+
+def wait_config_page(sb, timeout_sec=25):
+    """等待激活配置页出现(Game & Name / Order Summary / Start Server)"""
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        handle_cloudflare(sb, max_retry=1)
+        info = read_panel_info(sb)
+        if info.get("page") == "activate_config":
+            return info
+        time.sleep(1)
+    return read_panel_info(sb)
+
+
+def activate_server_if_needed(sb):
+    """
+    处理服务器到期后的 SkyMC 新激活流程:
+      Activate Your Server → COAL Free 卡片 → 配置页
+      (Location=France / Java Edition / Server Name 保持 SkyMC 默认值 /
+      跳过 Premium 专属的 Dedicated IP)→ Start Server
+    成功返回 True(后续由 wait_until_online 等待 Starting → Online)。
+    """
+    print("🧩 进入服务器重新激活流程(Activate Your Server)...")
+    info = read_panel_info(sb)
+    page = info.get("page")
+
+    # ---- 第 1 步:激活套餐页,点击 COAL Free 卡片 ----
+    if page == "activate_plan":
+        print("   [1/3] 激活套餐页:寻找 COAL Free 卡片 ...")
+        clicked = js_click_visible_text(sb, r"COAL\s+Free")
+        if not clicked:
+            clicked = js_click_visible_text(
+                sb, r"\bCOAL\b",
+                anti_pattern=r"Copper|Redstone|Iron|Lapis|Quartz|Order|Summary",
+            )
+        if clicked:
+            print(f"   ✅ 已点击 COAL 卡片:<{clicked.get('tag')}> "
+                  f"'{clicked.get('text')}' @ ({clicked.get('x')},{clicked.get('y')})")
+        else:
+            print("   ❌ 未找到可点击的 COAL Free 卡片")
+            safe_screenshot(sb, "activate_plan_not_found.png")
+            return False
+
+        # 点击后等待配置页出现
+        cfg = wait_config_page(sb, timeout_sec=25)
+        try:
+            print(f"   点击 COAL 后 URL: {sb.get_current_url()}")
+            print(f"   页面标题: {sb.get_title()}")
+        except Exception:
+            pass
+        key = dump_key_text(sb)
+        if key:
+            print(f"   页面关键文字: {key}")
+        if cfg.get("page") != "activate_config":
+            print("   ❌ 点击 COAL 后未出现配置页(Game & Name / Order Summary / Start Server)")
+            dump_clickables(sb)
+            safe_screenshot(sb, "activate_config_not_found.png")
+            return False
+        # 首轮调试:点击 COAL 后的页面状态
+        dump_clickables(sb)
+        safe_screenshot(sb, "activate_after_coal.png")
+    elif page == "activate_config":
+        print("   页面已处于激活配置页,跳过选择套餐步骤")
+    else:
+        print(f"   ❌ 未识别到激活页面(page={page}),放弃激活")
+        return False
+
+    # ---- 第 2 步:配置页确认 Location=France / Game=Java Edition ----
+    print("   [2/3] 配置页:确认 France / Java Edition,Server Name 保持默认 ...")
+    fr = js_click_visible_text(sb, r"\bFrance\b", anti_pattern=r"Germany|Order|Summary")
+    if fr:
+        print(f"   ✅ 已确认 Location=France(<{fr.get('tag')}> '{fr.get('text')}')")
+    else:
+        print("   ⚠️ 未定位到 France 选项(可能默认已选中),继续")
+
+    je = js_click_visible_text(sb, r"Java\s+Edition", anti_pattern=r"Bedrock")
+    if je:
+        print(f"   ✅ 已确认 Game=Java Edition(<{je.get('tag')}> '{je.get('text')}')")
+    else:
+        print("   ⚠️ 未定位到 Java Edition 选项(可能默认已选中),继续")
+
+    # Server Name:只读取,不修改(SkyMC 提供的默认值即为目标值)
+    name_info = read_server_name_value(sb)
+    if name_info is None:
+        print("   ⚠️ 未找到 Server Name 输入框")
+    elif name_info.get("value"):
+        print(f"   ℹ️ Server Name 保持 SkyMC 默认值:'{name_info.get('value')}'(不做修改)")
+    else:
+        print("   ⚠️ Server Name 输入框为空,按策略不主动填写,继续")
+
+    # Add-ons 的 Dedicated IP($3.99/monthly)仅 Premium 可用,Free 套餐完全跳过,不做任何操作
+
+    # ---- 第 3 步:点击 Start Server ----
+    print("   [3/3] 准备点击 Start Server ...")
+    print(f"   Start Server 前状态: Location点击={'成功' if fr else '未操作(默认?)'}  "
+          f"Game点击={'成功' if je else '未操作(默认?)'}  "
+          f"ServerName='{(name_info or {}).get('value', '<未找到输入框>')}'")
+    dump_clickables(sb)
+    safe_screenshot(sb, "activate_before_start.png")
+
+    clicked_start = click_named_button(sb, ["Start Server"])
+    if not clicked_start:
+        st = js_click_visible_text(sb, r"Start\s+Server")
+        if st:
+            print(f"   已通过 JS 点击 Start Server(<{st.get('tag')}> '{st.get('text')}')")
+            clicked_start = True
+    if not clicked_start:
+        print("   ❌ 未找到或未能点击 Start Server 按钮")
+        safe_screenshot(sb, "activate_start_failed.png")
+        return False
+
+    print("   ✅ 已提交 Start Server")
+    time.sleep(3)
+    handle_cloudflare(sb)
+    wait_challenge_gone(sb, timeout=15)
+    return True
+
+
 def wait_until_online(sb, timeout_sec=180, action_label="启动/重启"):
     """必须等到状态为 Online 才算成功。Starting 期间不继续续期。"""
     print(f"⏳ 等待服务器进入 Online（最多 {timeout_sec} 秒）...")
@@ -730,12 +1029,23 @@ def ensure_server_running(sb, info):
             return True, "等待 Starting 完成，服务器已 Online"
         return False, "Starting 超时，未进入 Online"
 
+    # 服务器到期后:SkyMC 新版进入 Activate Your Server 激活流程
+    # (面板没有普通 Start,需 COAL Free → France / Java Edition → Start Server)
+    if status == "needs_activation":
+        print("🧩 服务器需要重新激活(Activate Your Server 流程)...")
+        if not activate_server_if_needed(sb):
+            return False, "激活流程失败(未完成 COAL Free → Start Server)"
+        ok, _ = wait_until_online(sb, timeout_sec=240, action_label="激活启动")
+        if ok:
+            return True, "激活完成，服务器已 Online"
+        return False, "已提交 Start Server，但等待 Online 超时"
+
     # Offline / Stopped / unknown：点 Start
     print(f"🔌 服务器状态为 {status or 'unknown'}，尝试点击 Start ...")
     clicked = click_named_button(sb, ["Start", "启动"])
     if not clicked:
         try:
-            sb.execute_script(
+            res = sb.execute_script(
                 """
                 var icons = document.querySelectorAll('svg, i, button, div');
                 for (var i = 0; i < icons.length; i++) {
@@ -751,10 +1061,14 @@ def ensure_server_running(sb, info):
                 return false;
                 """
             )
-            clicked = True
-            print("   已通过播放图标尝试启动")
-        except Exception:
-            pass
+            # 只有 JS 明确返回 true 才算点击成功,不能把"执行了 JS"当"点击成功"
+            if res:
+                clicked = True
+                print("   已通过播放图标尝试启动")
+            else:
+                print("   未找到可点击的播放图标(fa-play),JS 返回 false")
+        except Exception as e:
+            print(f"   播放图标兜底异常: {e}")
 
     if not clicked and has_restart:
         print("   未找到 Start，尝试 Restart ...")
