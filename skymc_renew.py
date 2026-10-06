@@ -896,36 +896,29 @@ def dump_body_text(sb, tag="body_dump"):
 
 def selected_plan(sb):
     """返回当前处于选中态的套餐名(COAL/COPPER/...),识别不出返回 None。
-    只用于安全校验:确认选中的是 COAL Free 而不是付费套餐。"""
-    script = r"""
-        var names = ['COAL', 'COPPER', 'REDSTONE', 'IRON', 'LAPIS', 'QUARTZ'];
-        var nodes = document.querySelectorAll('button, [role="radio"], [role="option"], label');
-        for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            var t = ((n.innerText || n.textContent || '') + '').replace(/\s+/g, ' ').trim();
-            if (!t || t.length > 120) continue;
-            var hit = null;
-            for (var j = 0; j < names.length; j++) {
-                if (new RegExp('\\b' + names[j] + '\\b', 'i').test(t)) { hit = names[j]; break; }
-            }
-            if (!hit) continue;
-            var aria = ((n.getAttribute('aria-checked') || '') + ' ' +
-                        (n.getAttribute('aria-selected') || '') + ' ' +
-                        (n.getAttribute('data-state') || '')).toLowerCase();
-            var cls = (n.getAttribute('class') || '').toLowerCase();
-            var checked = /true|checked|selected|active/.test(aria) ||
-                          /border-primary|ring-2|bg-primary|border-blue|selected|outline-primary/.test(cls) ||
-                          !!n.querySelector('svg[class*="check"], svg[class*="Check"]');
-            if (checked) return hit;
-        }
-        return null;
+
+    判定信号(实测:class 里的 hover/data-state 变体会误判,不能用正则匹配 class):
+      1. 卡片内有勾选图标(svg check) —— 最可靠;
+      2. 否则比较 6 张卡的 computed borderTopColor,唯一不同的那张即选中项。
+    只用于安全校验:确认选中的是 COAL Free 而不是付费套餐。
     """
-    try:
-        raw = sb.execute_script(script)
-        return raw if raw else None
-    except Exception as e:
-        print(f"   识别选中套餐失败: {e}")
+    states = plan_states(sb)
+    if not states:
         return None
+    checked = [s for s in states if s.get("hasCheckIcon")]
+    if len(checked) == 1:
+        return checked[0].get("name")
+    counts = {}
+    for s in states:
+        c = s.get("borderColor") or ""
+        counts[c] = counts.get(c, 0) + 1
+    if len(counts) > 1:
+        for color, n in counts.items():
+            if n == 1:
+                for s in states:
+                    if (s.get("borderColor") or "") == color:
+                        return s.get("name")
+    return None
 
 
 def plan_states(sb):
@@ -951,8 +944,10 @@ def plan_states(sb):
                 ariaChecked: n.getAttribute('aria-checked') || '',
                 ariaSelected: n.getAttribute('aria-selected') || '',
                 dataState: n.getAttribute('data-state') || '',
-                hasCheckIcon: /lucide-check|check-circle|CircleCheck|Check/.test(inner),
-                hasSelClass: /border-(primary|blue|green)|ring-2|ring-primary|bg-primary|selected/.test(cls.toLowerCase()),
+                hasCheckIcon: !!n.querySelector('svg.lucide-check, svg[class*="check"], svg[class*="Check"]'),
+                hasSelClass: /\bborder-primary\b|\bring-2\b|\bring-primary\b|\bbg-primary\b/.test(cls),
+                borderColor: window.getComputedStyle(n).borderTopColor,
+                bgColor: window.getComputedStyle(n).backgroundColor,
                 cls: cls.slice(0, 100)
             });
         }
@@ -971,7 +966,8 @@ def print_plan_states(sb, label="套餐选中态"):
     for st in plan_states(sb):
         print(f"     {st.get('name'):<9} ariaChecked={st.get('ariaChecked')!r} "
               f"ariaSelected={st.get('ariaSelected')!r} dataState={st.get('dataState')!r} "
-              f"checkIcon={st.get('hasCheckIcon')} selClass={st.get('hasSelClass')}")
+              f"checkIcon={st.get('hasCheckIcon')} selClass={st.get('hasSelClass')} "
+              f"border={st.get('borderColor')!r} bg={st.get('bgColor')!r}")
         print(f"        text={st.get('text')!r}")
         print(f"        cls={st.get('cls')}")
 
@@ -1119,7 +1115,7 @@ def activate_server_if_needed(sb):
     # 保险:确认选中的是 COAL Free 而不是付费套餐,避免误下单
     plan = selected_plan(sb)
     if plan is None:
-        print("   ⚠️ 未能识别当前选中套餐(样式未匹配),按已点过 COAL 继续")
+        print("   ⚠️ 未能识别当前选中套餐(所有卡片样式相同或读取失败),按已点过 COAL 继续")
     elif plan.upper() == "COAL":
         print("   ✅ 已确认选中 COAL Free")
     else:
