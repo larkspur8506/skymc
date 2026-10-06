@@ -5,6 +5,11 @@ on:
     # 每小时的 0 分和 45 分各跑一次（约每 45 分钟）
     #- cron: '0,45 * * * *'
   workflow_dispatch:
+    inputs:
+      probe_only:
+        description: '只读探针：打开 /reactivate 并 dump 页面判定，不点击任何按钮'
+        type: boolean
+        default: false
 
 jobs:
   renew:
@@ -45,6 +50,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           NODE_LINK: ${{ secrets.NODE_LINK }}
+          PROBE_ONLY: ${{ inputs.probe_only }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" python skymc_renew.py
 

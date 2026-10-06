@@ -8,6 +8,7 @@ v12 新增 NODE_LINK（vless:// 或 vmess://）启动 sing-box 本地代理。
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -31,6 +32,7 @@ SERVER_ID = "xWFsEb7CjA2n"
 
 NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROBE_ONLY = os.environ.get("PROBE_ONLY", "false").lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:7890"
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -515,11 +517,15 @@ def read_panel_info(sb):
         var body = (document.body && document.body.innerText) ? document.body.innerText : '';
         // 新版 SkyMC:服务器到期后面板变为激活流程,先识别页面类型,再判断普通按钮
         var page = null;
-        if (/Activate\s+Your\s+Server/i.test(body)) {
-            page = 'activate_plan';
-        } else if (/Game\s*&\s*Name/i.test(body) || /Order\s+Summary/i.test(body) ||
-                   (/Start\s+Server/i.test(body) && /Add-?\s*ons/i.test(body))) {
+        // SkyMC 的 /reactivate 是单页流程(套餐 + Location + Start Server 同页):
+        // 选完 COAL 后 "Activate Your Server" 标题仍在 body 里,
+        // 所以配置页标记必须先判,否则永远停在 activate_plan。
+        if (/Game\s*&?\s*Name/i.test(body) || /Order\s+Summary/i.test(body) ||
+            (/Start\s+Server/i.test(body) &&
+             (/Add-?\s*ons/i.test(body) || /Location|France|Germany/i.test(body)))) {
             page = 'activate_config';
+        } else if (/Activate\s+Your\s+Server/i.test(body)) {
+            page = 'activate_plan';
         }
         var status = 'unknown';
         if (page) {
@@ -847,7 +853,7 @@ def js_click_visible_text(sb, pattern, anti_pattern=None):
 
 
 def wait_config_page(sb, timeout_sec=25):
-    """等待激活配置页出现(Game & Name / Order Summary / Start Server)"""
+    """等待激活配置页出现(Game & Name / Order Summary / Start Server,或单页流程的 Location+Start Server)"""
     end = time.time() + timeout_sec
     while time.time() < end:
         handle_cloudflare(sb, max_retry=1)
@@ -856,6 +862,100 @@ def wait_config_page(sb, timeout_sec=25):
             return info
         time.sleep(1)
     return read_panel_info(sb)
+
+
+def dump_body_text(sb, tag="body_dump"):
+    """调试:把 body.innerText 打到 CI 日志,便于离线复盘。
+    仓库是公开的、Actions 日志公开,所以必须脱敏:邮箱替换、只打前 120 行、总长封顶。"""
+    try:
+        txt = sb.execute_script(
+            "return (document.body && document.body.innerText) ? document.body.innerText : '';")
+    except Exception as e:
+        print(f"   dump_body_text 失败: {e}")
+        return
+    if not txt:
+        print(f"   ---- {tag}: body 为空 ----")
+        return
+    txt = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "***@***", str(txt))
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    print(f"   ---- {tag} body.innerText 开始(共 {len(lines)} 行,已脱敏) ----")
+    total = 0
+    for line in lines[:120]:
+        line = line[:160]
+        total += len(line)
+        if total > 4000:
+            print("   | ...(截断)")
+            break
+        print(f"   | {line}")
+    if len(lines) > 120:
+        print(f"   | ...(余下 {len(lines) - 120} 行省略)")
+    print(f"   ---- {tag} body.innerText 结束 ----")
+
+
+def selected_plan(sb):
+    """返回当前处于选中态的套餐名(COAL/COPPER/...),识别不出返回 None。
+    只用于安全校验:确认选中的是 COAL Free 而不是付费套餐。"""
+    script = r"""
+        var names = ['COAL', 'COPPER', 'REDSTONE', 'IRON', 'LAPIS', 'QUARTZ'];
+        var nodes = document.querySelectorAll('button, [role="radio"], [role="option"], label');
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var t = ((n.innerText || n.textContent || '') + '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 120) continue;
+            var hit = null;
+            for (var j = 0; j < names.length; j++) {
+                if (new RegExp('\\b' + names[j] + '\\b', 'i').test(t)) { hit = names[j]; break; }
+            }
+            if (!hit) continue;
+            var aria = ((n.getAttribute('aria-checked') || '') + ' ' +
+                        (n.getAttribute('aria-selected') || '') + ' ' +
+                        (n.getAttribute('data-state') || '')).toLowerCase();
+            var cls = (n.getAttribute('class') || '').toLowerCase();
+            var checked = /true|checked|selected|active/.test(aria) ||
+                          /border-primary|ring-2|bg-primary|border-blue|selected|outline-primary/.test(cls) ||
+                          !!n.querySelector('svg[class*="check"], svg[class*="Check"]');
+            if (checked) return hit;
+        }
+        return null;
+    """
+    try:
+        raw = sb.execute_script(script)
+        return raw if raw else None
+    except Exception as e:
+        print(f"   识别选中套餐失败: {e}")
+        return None
+
+
+def probe_reactivate(sb):
+    """只读探针:打开 /reactivate 页面,输出页面类型判定 + 可点元素,不做任何点击。
+    用于在不真正过期的前提下验证页面判定逻辑。"""
+    url = SERVER_URL.rstrip("/") + "/reactivate"
+    print(f"🔬 探针模式:打开 {url}(只读,不点击任何按钮)")
+    try:
+        sb.uc_open_with_reconnect(url, reconnect_time=5)
+    except Exception:
+        sb.open(url)
+    sb.wait_for_ready_state_complete()
+    time.sleep(4)
+    handle_cloudflare(sb)
+    wait_challenge_gone(sb, timeout=15)
+    time.sleep(2)
+    try:
+        print(f"   探针 URL: {sb.get_current_url()}")
+        print(f"   页面标题: {sb.get_title()}")
+    except Exception:
+        pass
+    info = read_panel_info(sb)
+    print(f"   探针判定: status={info.get('status')} page={info.get('page')} "
+          f"Start={info.get('hasStart')} Expires={info.get('hasExpires')} Renew={info.get('hasRenew')}")
+    key = dump_key_text(sb)
+    if key:
+        print(f"   关键文字: {key}")
+    print(f"   当前选中套餐: {selected_plan(sb)}")
+    dump_clickables(sb)
+    dump_body_text(sb, "probe_reactivate")
+    safe_screenshot(sb, "probe_reactivate.png")
+    return True
 
 
 def activate_server_if_needed(sb):
@@ -897,9 +997,10 @@ def activate_server_if_needed(sb):
         key = dump_key_text(sb)
         if key:
             print(f"   页面关键文字: {key}")
-        if cfg.get("page") != "activate_config":
+        if cfg.get("page") not in ("activate_config",):
             print("   ❌ 点击 COAL 后未出现配置页(Game & Name / Order Summary / Start Server)")
             dump_clickables(sb)
+            dump_body_text(sb, "activate_config_not_found")
             safe_screenshot(sb, "activate_config_not_found.png")
             return False
         # 首轮调试:点击 COAL 后的页面状态
@@ -943,6 +1044,23 @@ def activate_server_if_needed(sb):
           f"ServerName='{(name_info or {}).get('value', '<未找到输入框>')}'")
     dump_clickables(sb)
     safe_screenshot(sb, "activate_before_start.png")
+
+    # 保险:确认选中的是 COAL Free 而不是付费套餐,避免误下单
+    plan = selected_plan(sb)
+    if plan is None:
+        print("   ⚠️ 未能识别当前选中套餐(样式未匹配),按已点过 COAL 继续")
+    elif plan.upper() == "COAL":
+        print("   ✅ 已确认选中 COAL Free")
+    else:
+        print(f"   ⚠️ 当前选中的是 {plan}(付费套餐),改选 COAL Free ...")
+        js_click_visible_text(sb, r"COAL\s+Free")
+        time.sleep(2)
+        plan2 = selected_plan(sb)
+        if plan2 and plan2.upper() != "COAL":
+            print(f"   ❌ 改选后仍为 {plan2},放弃点击 Start Server(避免下单付费套餐)")
+            dump_body_text(sb, "activate_paid_plan_selected")
+            safe_screenshot(sb, "activate_paid_plan_selected.png")
+            return False
 
     clicked_start = click_named_button(sb, ["Start Server"])
     if not clicked_start:
@@ -1549,7 +1667,7 @@ def main():
         print("❌ 请设置环境变量 SKYMC_EMAIL 和 SKYMC_PASSWORD")
         sys.exit(1)
 
-    print("🚀 启动 SkyMC 自动续期脚本 v12.4")
+    print("🚀 启动 SkyMC 自动续期脚本 v12.5")
     print(f"目标服务器: {SERVER_URL}")
 
     start_singbox_from_node_link()
@@ -1567,6 +1685,11 @@ def main():
             msg = f"❌ 登录失败\nIP: {current_ip}"
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
+            sys.exit(1)
+
+        if PROBE_ONLY:
+            probe_reactivate(sb)
+            print("🔬 探针模式结束(未执行续期,未点击任何按钮)")
             return
 
         open_server_panel(sb)
@@ -1590,8 +1713,8 @@ def main():
             )
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="final_result.png")
-            print("🏁 脚本执行完毕")
-            return
+            print("🏁 脚本执行完毕(失败,退出码 1)")
+            sys.exit(1)
 
         # Online 后确认侧边栏 Expires 入口（新 UI 的续期入口）
         if not after_start.get("hasExpires") and not after_start.get("hasRenew"):
@@ -1648,6 +1771,9 @@ def main():
         if not renew_ok and os.path.exists("renew_not_found.png"):
             img = "renew_not_found.png"
         send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path=img)
+        if not renew_ok:
+            print("🏁 脚本执行完毕(续期失败,退出码 1)")
+            sys.exit(1)
 
     print("🏁 脚本执行完毕")
 
