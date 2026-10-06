@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       probe_only:
-        description: '只读探针：打开 /reactivate 并 dump 页面判定，不点击任何按钮'
-        type: boolean
-        default: false
+        description: '探针: 留空=正常续期; read=只读dump; coal=只读dump+点COAL后再dump(不会点Start Server)'
+        type: string
+        default: ''
 
 jobs:
   renew:

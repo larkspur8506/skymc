@@ -32,7 +32,9 @@ SERVER_ID = "xWFsEb7CjA2n"
 
 NODE_LINK = (os.environ.get("NODE_LINK") or "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-PROBE_ONLY = os.environ.get("PROBE_ONLY", "false").lower() == "true"
+PROBE_ONLY = (os.environ.get("PROBE_ONLY") or "").strip().lower()
+# 探针模式: ""=正常续期 / read(或 true,1)=只读 dump / coal=只读 dump + 点 COAL 后再 dump(永不点 Start Server)
+PROBE_MODE = "coal" if PROBE_ONLY == "coal" else ("read" if PROBE_ONLY in ("1", "true", "yes", "read") else "")
 PROXY_SERVER = os.environ.get("PROXY_SERVER") or "socks5://127.0.0.1:7890"
 SINGBOX_PORT = int(os.environ.get("SINGBOX_PORT") or "7890")
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -926,8 +928,57 @@ def selected_plan(sb):
         return None
 
 
-def probe_reactivate(sb):
-    """只读探针:打开 /reactivate 页面,输出页面类型判定 + 可点元素,不做任何点击。
+def plan_states(sb):
+    """列出 6 个套餐卡片的原始选中态信号(调试 + 安全校验共用)"""
+    script = r"""
+        var names = ['COAL', 'COPPER', 'REDSTONE', 'IRON', 'LAPIS', 'QUARTZ'];
+        var out = [];
+        var nodes = document.querySelectorAll('button, [role="radio"], [role="option"], label');
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var t = ((n.innerText || n.textContent || '') + '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 120) continue;
+            var hit = null;
+            for (var j = 0; j < names.length; j++) {
+                if (new RegExp('\\b' + names[j] + '\\b', 'i').test(t)) { hit = names[j]; break; }
+            }
+            if (!hit) continue;
+            var cls = n.getAttribute('class') || '';
+            var inner = n.innerHTML || '';
+            out.push({
+                name: hit,
+                text: t.slice(0, 40),
+                ariaChecked: n.getAttribute('aria-checked') || '',
+                ariaSelected: n.getAttribute('aria-selected') || '',
+                dataState: n.getAttribute('data-state') || '',
+                hasCheckIcon: /lucide-check|check-circle|CircleCheck|Check/.test(inner),
+                hasSelClass: /border-(primary|blue|green)|ring-2|ring-primary|bg-primary|selected/.test(cls.toLowerCase()),
+                cls: cls.slice(0, 100)
+            });
+        }
+        return JSON.stringify(out);
+    """
+    try:
+        raw = sb.execute_script(script)
+        return json.loads(raw) if raw else []
+    except Exception as e:
+        print(f"   读取套餐选中态失败: {e}")
+        return []
+
+
+def print_plan_states(sb, label="套餐选中态"):
+    print(f"   {label}:")
+    for st in plan_states(sb):
+        print(f"     {st.get('name'):<9} ariaChecked={st.get('ariaChecked')!r} "
+              f"ariaSelected={st.get('ariaSelected')!r} dataState={st.get('dataState')!r} "
+              f"checkIcon={st.get('hasCheckIcon')} selClass={st.get('hasSelClass')}")
+        print(f"        text={st.get('text')!r}")
+        print(f"        cls={st.get('cls')}")
+
+
+def probe_reactivate(sb, click_coal=False):
+    """只读探针:打开 /reactivate 页面,输出页面类型判定 + 可点元素。
+    click_coal=True 时额外点击 COAL Free(仅选择套餐),但永不点击 Start Server。
     用于在不真正过期的前提下验证页面判定逻辑。"""
     url = SERVER_URL.rstrip("/") + "/reactivate"
     print(f"🔬 探针模式:打开 {url}(只读,不点击任何按钮)")
@@ -952,9 +1003,29 @@ def probe_reactivate(sb):
     if key:
         print(f"   关键文字: {key}")
     print(f"   当前选中套餐: {selected_plan(sb)}")
+    print_plan_states(sb, "点击前套餐选中态")
     dump_clickables(sb)
     dump_body_text(sb, "probe_reactivate")
     safe_screenshot(sb, "probe_reactivate.png")
+
+    if not click_coal:
+        return True
+
+    print("🔬 探针第二步:点击 COAL Free(只选择套餐,绝不点 Start Server)")
+    clicked = js_click_visible_text(sb, r"COAL\s+Free")
+    print(f"   点击结果: {clicked}")
+    time.sleep(4)
+    info2 = read_panel_info(sb)
+    print(f"   点后判定: status={info2.get('status')} page={info2.get('page')} "
+          f"Start={info2.get('hasStart')}")
+    print(f"   点后选中套餐: {selected_plan(sb)}")
+    print_plan_states(sb, "点击后套餐选中态")
+    key2 = dump_key_text(sb)
+    if key2:
+        print(f"   点后关键文字: {key2}")
+    dump_clickables(sb)
+    dump_body_text(sb, "probe_after_coal")
+    safe_screenshot(sb, "probe_after_coal.png")
     return True
 
 
@@ -1687,9 +1758,9 @@ def main():
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg, image_path="login_failed.png")
             sys.exit(1)
 
-        if PROBE_ONLY:
-            probe_reactivate(sb)
-            print("🔬 探针模式结束(未执行续期,未点击任何按钮)")
+        if PROBE_MODE:
+            probe_reactivate(sb, click_coal=(PROBE_MODE == "coal"))
+            print(f"🔬 探针模式结束(mode={PROBE_MODE},未执行续期,未点击 Start Server)")
             return
 
         open_server_panel(sb)
